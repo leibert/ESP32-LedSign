@@ -118,13 +118,17 @@ const int fontCount = sizeof(fonts) / sizeof(fonts[0]);
 String currentMode = RUN_TEST_ON_BOOT ? "test" : "bigClock";
 uint16_t primaryColor = 0x001F;   ///< Primary text color (Blue default)
 bool isDisplayOn = true;          ///< Global display toggle
+bool countdownEnabled = true;     ///< Feature toggle for event countdown
+bool messageEnabled = true;       ///< Feature toggle for messages
 bool hasBooted = !RUN_TEST_ON_BOOT; ///< Tracks completion of boot sequence
+bool forceCountdown = false;      ///< If true, show countdown regardless of time
 unsigned long lastFrameTime = 0;   ///< Timing for frame rate control
 int timeZoneOffset = DEFAULT_TIMEZONE; ///< Current offset in hours
 
 // Content Buffers
 String statusLine = "Sign Online";
 String msgHeader = "", msgBody = "";
+String line1 = "", line2 = "", line3 = "";
 bool pendingCommand = false;
 
 // Scrolling & Positioning
@@ -134,7 +138,10 @@ int16_t scrollWidth = 0;
 // Event Data
 bool activeEvent = false;
 time_t eventTime = 0;
-String eventSubject = "", eventHost = "";
+String eventSubject = "", eventHost = "", eventAttendees = "";
+
+// Messaging Data
+String messageType = "", messageSender = "";
 
 // --- UTILITY FUNCTIONS ---
 
@@ -208,33 +215,79 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   String t = String(topic);
   
   if (t == "ledSign/mode") {
-    currentMode = msg;
-    isDisplayOn = (currentMode != "OFF");
-    pendingCommand = true;
+    if (msg.equalsIgnoreCase("ON") || msg.equalsIgnoreCase("OFF")) {
+      DEBUG_PRINTLN("Ignored power command on mode topic: " + msg);
+    } else if (msg == "eventCountdown" && !countdownEnabled) {
+      DEBUG_PRINTLN("Ignored mode request: countdown disabled");
+    } else if (msg == "message" && !messageEnabled) {
+      DEBUG_PRINTLN("Ignored mode request: message disabled");
+    } else {
+      DEBUG_PRINTLN("Mode Change Request: " + msg);
+      currentMode = msg;
+      pendingCommand = true;
+      forceCountdown = (currentMode == "eventCountdown");
+    }
   } 
   else if (t == "ledSign/color") {
+    DEBUG_PRINTLN("Color Update: " + msg);
     primaryColor = parseColor(msg);
   }
   else if (t == "ledSign/timezone") {
+    DEBUG_PRINTLN("Timezone Update: " + msg);
     updateTimezone(msg.toInt());
   }
   else if (t == "ledSign/message/header") {
     msgHeader = msg;
     pendingCommand = true;
   }
+  else if (t == "ledSign/message/type") {
+    messageType = msg;
+    pendingCommand = true;
+  }
+  else if (t == "ledSign/message/sender") {
+    messageSender = msg;
+    pendingCommand = true;
+  }
   else if (t == "ledSign/message/text") {
     msgBody = msg;
     pendingCommand = true;
   }
+  else if (t == "ledSign/line1") {
+    line1 = msg;
+    pendingCommand = true;
+  }
+  else if (t == "ledSign/line2") {
+    line2 = msg;
+    pendingCommand = true;
+  }
+  else if (t == "ledSign/line3") {
+    line3 = msg;
+    pendingCommand = true;
+  }
   else if (t == "ledSign/EN") {
     isDisplayOn = !msg.equalsIgnoreCase("OFF");
-    currentMode = isDisplayOn ? "bigClock" : "OFF";
+    DEBUG_PRINTLN("Display Enable: " + String(isDisplayOn));
+  }
+  else if (t == "ledSign/countdownEN") {
+    countdownEnabled = !msg.equalsIgnoreCase("OFF");
+    DEBUG_PRINTLN("Countdown Enable: " + String(countdownEnabled));
+  }
+  else if (t == "ledSign/messageEN") {
+    messageEnabled = !msg.equalsIgnoreCase("OFF");
+    DEBUG_PRINTLN("Message Enable: " + String(messageEnabled));
   }
   else if (t.startsWith("nextEvent/")) {
     activeEvent = true;
-    if (t.endsWith("timeStamp")) eventTime = (time_t)msg.toFloat();
-    else if (t.endsWith("subject")) eventSubject = msg;
+    DEBUG_PRINTLN("Event Data [" + t + "]: " + msg);
+    if (t.endsWith("timeStamp")) {
+      eventTime = (time_t)strtoll(msg.c_str(), NULL, 10);
+      DEBUG_PRINTLN("Parsed Event Time (strtoll): " + String((int64_t)eventTime));
+    }
+    else if (t.endsWith("subject")) {
+      eventSubject = msg;
+    }
     else if (t.endsWith("organizer")) eventHost = msg;
+    else if (t.endsWith("attendees")) eventAttendees = msg;
   }
 }
 
@@ -273,7 +326,56 @@ static void drawCenteredBoth(const String &text, uint16_t color = primaryColor) 
   display->print(text);
 }
 
+// Scrolling State
+struct ScrollState {
+  int16_t pos;
+  unsigned long lastScroll;
+  bool active;
+};
+ScrollState scroll1 = {96, 0, false};
+ScrollState scroll2 = {96, 0, false};
+
+/**
+ * @brief Draws text with scrolling if it exceeds a maximum width.
+ */
+static void drawScrollingLine(int16_t x_min, int16_t x_max, int16_t y, const String &text, const GFXfont* font, uint16_t color, ScrollState &state) {
+  display->setFont(font);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display->getTextBounds(text, 0, y, &x1, &y1, &w, &h);
+  
+  int16_t max_w = x_max - x_min;
+  
+  if (w > max_w) {
+    if (millis() - state.lastScroll > 40) { // ~25 FPS scroll
+      state.pos--;
+      if (state.pos + (int16_t)w < x_min) state.pos = x_max;
+      state.lastScroll = millis();
+    }
+    display->setCursor(state.pos, y);
+  } else {
+    display->setCursor(x_min, y);
+  }
+  display->setTextColor(color);
+  display->print(text);
+}
+
 // --- RENDER MODES ---
+
+/**
+ * @brief Displays up to 3 static lines of text with scrolling for the first two.
+ */
+void modeStatic() {
+  if (pendingCommand) {
+    scroll1.pos = 96; scroll2.pos = 96;
+    pendingCommand = false;
+  }
+  drawScrollingLine(0, 96, 5, line1, &Picopixel, primaryColor, scroll1);
+  drawScrollingLine(0, 96, 10, line2, &Picopixel, primaryColor, scroll2);
+  display->setFont(&Picopixel);
+  display->setCursor(0, 15);
+  display->print(line3);
+}
 
 /**
  * @brief Cycles through all defined fonts, displaying the font name in each.
@@ -295,6 +397,31 @@ void modeClock() {
   display->setFont(&FreeSansBold9pt7b); // Ensure default font
   // display->setFont(&FreeSansBold9pt7b); // Ensure default font
   drawLine(13,13, timeStr, primaryColor); // Centered vertically in a single line
+}
+
+/**
+ * @brief Displays the clock with cycling rainbow colors for each character.
+ */
+void modeRainbowClock() {
+  String timeStr = getFormattedTime("%H:%M:%S");
+  display->setFont(&FreeSansBold9pt7b);
+  display->setCursor(13, 13);
+  
+  for (int i = 0; i < (int)timeStr.length(); i++) {
+    uint8_t pos = (uint8_t)((millis() / 5 + i * 20) % 255);
+    uint16_t color;
+    if (pos < 85) {
+      color = display->color565(pos * 3, 255 - pos * 3, 0);
+    } else if (pos < 170) {
+      pos -= 85;
+      color = display->color565(255 - pos * 3, 0, pos * 3);
+    } else {
+      pos -= 170;
+      color = display->color565(0, pos * 3, 255 - pos * 3);
+    }
+    display->setTextColor(color);
+    display->print(timeStr[i]);
+  }
 }
 
 /**
@@ -323,10 +450,11 @@ void modeBigClock() {
   // Manual center: Picopixel is ~3px wide + 1px space = 4px
   // int16_t xDate = (96 - (dateStr.length() * 4)) / 2;
   display->setTextColor(colorDate);
-  display->setCursor(10, 4); // Baseline 4 = Rows 0-4
+  // display->setCursor(10, 4); // Baseline 4 = Rows 0-4
+  drawCentered(4, dateStr, colorDate);
   // display->setCursor(xDate, 4); // Baseline 4 = Rows 0-4
 
-  display->print(dateStr);
+  // display->print(dateStr);
   
   // 2. Draw Time (Restore Default font - 8px high)
   // display->setFont(); 
@@ -336,30 +464,182 @@ void modeBigClock() {
   int16_t xTime = (96 - (timeStr.length() * 6)) / 2;
   display->setTextColor(colorTime);
   // display->setCursor(xTime, 7); // Row 7 = Starts at Row 7 (leaving Row 6 as gap)
-  display->setCursor(21, 15); // Row 7 = Starts at Row 7 (leaving Row 6 as gap)
+  display->setCursor(20, 15); // Row 7 = Starts at Row 7 (leaving Row 6 as gap)
   
   display->print(timeStr);
 }
 
 void modeScroll() {
-  if (scrollWidth == 0) {
-    scrollWidth = (int16_t)statusLine.length() * 6;
-    scrollPos = (int16_t)display->width();
+  if (pendingCommand) {
+    scroll1.pos = 96;
+    pendingCommand = false;
   }
-  if (millis() % 50 == 0) scrollPos--;
-  if (scrollPos + scrollWidth < 0) scrollPos = (int16_t)display->width();
-  display->setFont();
-  drawLine(scrollPos, 4, statusLine);
+  drawScrollingLine(0, 96, 8, line1, &FreeSans7pt7b, primaryColor, scroll1);
 }
 
 void modeMessage() {
+  if(msgBody.length()==0){
+    pendingCommand = false;
+    return;
+  }
   if (pendingCommand) {
-    scrollPos = (int16_t)display->width();
+    scroll1.pos = 96; scroll2.pos = 96;
     pendingCommand = false;
   }
-  display->setFont();
-  drawLine(2, 0, msgHeader.substring(0, 16), 0xFFFF);
-  drawLine(2, 8, msgBody.substring(0, 16), primaryColor);
+  
+  String l1 = messageType + (messageSender.length() > 0 ? " || " + messageSender : "");
+  if (l1 == "") l1 = msgHeader;
+
+  drawScrollingLine(0, 96, 4, l1, &Picopixel, 0x001F, scroll1);
+  drawScrollingLine(0, 96, 14, msgBody, &FreeSans7pt7b, 0xFFE0, scroll2);
+}
+
+/**
+ * @brief Displays an event countdown with flashing backgrounds and alternating scrolling lines.
+ */
+void modeEventCountdown() {
+  if (eventSubject == "") {
+    currentMode = "bigClock";
+    forceCountdown = false;
+    return;
+  }
+
+  time_t now_t;
+  time(&now_t);
+  long diff = (long)eventTime - (long)now_t;
+
+  // Exit condition: if not forced and more than 5m out, or if more than 2m past
+  if (diff > 300 && !forceCountdown) {
+    DEBUG_PRINTLN("Event too far out (>5m), returning to bigClock");
+    currentMode = "bigClock";
+    return;
+  }
+
+  // 1. Background Flashing Logic
+  if (diff > 0) {
+    if (diff < 300 && diff > 290 && (diff % 2)) display->fillScreen(display->color565(80, 80, 80));
+    else if (diff < 120 && diff > 110 && (diff % 2)) display->fillScreen(display->color565(80, 80, 0));
+    else if (diff < 60 && diff > 50 && (diff % 2)) display->fillScreen(display->color565(150, 0, 0));
+    else if (diff < 10 && diff > 0 && (diff % 2)) display->fillScreen(display->color565(0, 60, 0));
+  } else {
+    if (diff > -5) display->fillScreen(display->color565(0, 100, 0));
+    else if (diff < -120) {
+      DEBUG_PRINTLN("Event finished, returning to bigClock");
+      currentMode = "bigClock";
+      forceCountdown = false;
+      return;
+    }
+  }
+
+  // 2. Right Column (Clock and Timer)
+  String timeStr = getFormattedTime("%H:%M:%S");
+  // display->setFont(&Picopixel);
+  display->setFont(nullptr);
+
+  display->setTextColor(display->color565(128, 128, 128));
+  display->setCursor(67, 0);
+  display->print(timeStr);
+
+  long absDiff = abs(diff);
+  String sign = "";
+  if (diff > 0) sign = "-";
+  else if (diff < 0) sign = "+";
+  
+  String timerStr = sign + String(absDiff / 60) + ":" + (absDiff % 60 < 10 ? "0" : "") + String(absDiff % 60);
+  uint16_t timerColor = (diff >= 0 ? display->color565(160, 160, 0) : display->color565(0, 80, 0));
+  
+  static long lastLoggedDiff = -999;
+  if (abs(diff - lastLoggedDiff) >= 1) {
+    DEBUG_PRINTLN("Countdown: " + timerStr + " (Diff: " + String(diff) + ", Now: " + String(now_t) + ", Event: " + String(eventTime) + ")");
+    lastLoggedDiff = diff;
+  }
+
+  int16_t timerX = (absDiff / 60 >= 10) ? 61 : 65;
+  display->setFont(nullptr);
+  display->setTextColor(timerColor);
+  display->setCursor(timerX, 9);
+  display->print(timerStr);
+
+  // 3. Left Content (Scrolling lines)
+  if (pendingCommand) {
+    scroll1.pos = 64; scroll2.pos = 64;
+    pendingCommand = false;
+  }
+
+  // drawScrollingLine(0, 64, 9, eventSubject, &Picopixel, display->color565(0, 0, 255), scroll1);
+  drawScrollingLine(0, 64, 0, eventSubject, nullptr, display->color565(0, 0, 255), scroll1);
+
+  String subLine = "";
+  if ((now_t % 60) < 15) subLine = "Org:" + eventHost;
+  else subLine = eventAttendees;
+  
+  drawScrollingLine(0, 64, 15, subLine, &Picopixel, display->color565(128, 128, 128), scroll2);
+}
+
+/**
+ * @brief Displays upcoming event details with the start time instead of a countdown.
+ */
+void modeNextEvent() {
+  if (eventSubject == "") {
+    currentMode = "bigClock";
+    return;
+  }
+
+  // 1. Current Clock (Top Right)
+  String timeStr = getFormattedTime("%H:%M:%S");
+  display->setFont(nullptr);
+  display->setTextColor(display->color565(128, 128, 128));
+  display->setCursor(67, 0);
+  display->print(timeStr);
+
+  // 2. Event Start Time (Bottom Right)
+  struct tm *eventInfo = localtime(&eventTime);
+  char startTimeBuf[10];
+  strftime(startTimeBuf, sizeof(startTimeBuf), "%H:%M", eventInfo);
+  
+  display->setFont(nullptr);
+  display->setTextColor(display->color565(0, 255, 0)); // Green for scheduled time
+  display->setCursor(67, 9);
+  display->print(startTimeBuf);
+
+  // 3. Left Content (Scrolling lines)
+  if (pendingCommand) {
+    scroll1.pos = 64; scroll2.pos = 64;
+    pendingCommand = false;
+  }
+
+  drawScrollingLine(0, 64, 0, eventSubject, nullptr, display->color565(0, 0, 255), scroll1);
+
+  time_t now_t;
+  time(&now_t);
+  String subLine = "";
+  if ((now_t % 60) < 15) subLine = "Org:" + eventHost;
+  else subLine = eventAttendees;
+  
+  drawScrollingLine(0, 64, 15, subLine, &Picopixel, display->color565(128, 128, 128), scroll2);
+}
+
+/**
+ * @brief Test mode for messages to try out all fonts in the message body position.
+ */
+void modeMessageTest() {
+  int index = (millis() / FONT_CYCLE_SPEED) % fontCount;
+  const GFXfont* f = fonts[index].font;
+  String name = fonts[index].name;
+
+  if (pendingCommand) {
+    scroll1.pos = 96; scroll2.pos = 96;
+    pendingCommand = false;
+  }
+
+  // Line 1: Font Name (Picopixel)
+  display->setFont(&Picopixel);
+  display->setTextColor(display->color565(0, 255, 255)); // Cyan
+  display->setCursor(0, 4);
+  display->print("FONT: " + name);
+
+  // Line 2: Sample text in the target font
+  drawScrollingLine(0, 96, 15, "ABCDEFGHIJ klmnopqrst 1234567890", f, 0xFFE0, scroll2);
 }
 
 void modeTestPattern() {
@@ -400,7 +680,7 @@ void render() {
   lastFrameTime = millis();
 
   display->clearScreen();
-  if (!isDisplayOn || currentMode == "OFF") {
+  if (!isDisplayOn) {
     display->flipDMABuffer();
     return;
   }
@@ -409,11 +689,16 @@ void render() {
 
   if (currentMode == "clock") modeClock();
   else if (currentMode == "bigClock") modeBigClock();
+  else if (currentMode == "rainbowClock") modeRainbowClock();
   else if (currentMode == "message") modeMessage();
   else if (currentMode == "scroll") modeScroll();
+  else if (currentMode == "static") modeStatic();
   else if (currentMode == "test") modeTestPattern();
   else if (currentMode == "calibrate") modeCalibration();
   else if (currentMode == "fontTest") modeFontTest();
+  else if (currentMode == "messageTest") modeMessageTest();
+  else if (currentMode == "eventCountdown") modeEventCountdown();
+  else if (currentMode == "nextEvent") modeNextEvent();
   else modeClock();
 
   display->flipDMABuffer();
@@ -433,6 +718,7 @@ void setupHardware() {
   display = new MatrixPanel_I2S_DMA(config);
   display->begin();
   display->setBrightness8(200);
+  display->setTextWrap(false);
 }
 
 void setupNetwork() {
@@ -443,7 +729,7 @@ void setupNetwork() {
 
   WebSerial.begin(&server);
   server.begin();
-  ArduinoOTA.setHostname("esp32-ledsign");
+  ArduinoOTA.setHostname("ledsign");
   ArduinoOTA.begin();
 
   mqtt.setServer(MQTT_SERVER, MQTT_PORT);
