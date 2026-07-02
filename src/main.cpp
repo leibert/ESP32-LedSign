@@ -116,6 +116,7 @@ const int fontCount = sizeof(fonts) / sizeof(fonts[0]);
 
 // System State
 String currentMode = RUN_TEST_ON_BOOT ? "test" : "bigClock";
+String previousMode = "bigClock";
 uint16_t primaryColor = 0x001F;   ///< Primary text color (Blue default)
 bool isDisplayOn = true;          ///< Global display toggle
 bool countdownEnabled = true;     ///< Feature toggle for event countdown
@@ -129,6 +130,12 @@ int timeZoneOffset = DEFAULT_TIMEZONE; ///< Current offset in hours
 String statusLine = "Sign Online";
 String msgHeader = "", msgBody = "";
 String line1 = "", line2 = "", line3 = "";
+String todoLine1 = "TODO:";
+String todoLine2 = "None";
+bool todoClockRunning = false;
+unsigned long todoStartMillis = 0;
+unsigned long todoStopMillis = 0;
+unsigned long todoFinalElapsedSecs = 0;
 bool pendingCommand = false;
 
 // Scrolling & Positioning
@@ -142,6 +149,7 @@ String eventSubject = "", eventHost = "", eventAttendees = "";
 
 // Messaging Data
 String messageType = "", messageSender = "";
+unsigned long lastMessageTime = 0;
 
 // --- UTILITY FUNCTIONS ---
 
@@ -223,7 +231,13 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       DEBUG_PRINTLN("Ignored mode request: message disabled");
     } else {
       DEBUG_PRINTLN("Mode Change Request: " + msg);
+      if (currentMode != msg && currentMode != "message" && currentMode != "test" && currentMode != "messageTest") {
+        previousMode = currentMode;
+      }
       currentMode = msg;
+      if (currentMode == "message") {
+        lastMessageTime = millis();
+      }
       pendingCommand = true;
       forceCountdown = (currentMode == "eventCountdown");
     }
@@ -239,18 +253,32 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   else if (t == "ledSign/message/header") {
     msgHeader = msg;
     pendingCommand = true;
+    lastMessageTime = millis();
   }
   else if (t == "ledSign/message/type") {
     messageType = msg;
     pendingCommand = true;
+    lastMessageTime = millis();
   }
   else if (t == "ledSign/message/sender") {
     messageSender = msg;
     pendingCommand = true;
+    lastMessageTime = millis();
   }
   else if (t == "ledSign/message/text") {
+    static String lastMsgBodyReceived = "";
+    static unsigned long lastMsgTimeReceived = 0;
+    
+    if (msg == lastMsgBodyReceived && (millis() - lastMsgTimeReceived < 10000)) {
+      DEBUG_PRINTLN("Ignored duplicate message: " + msg);
+      return;
+    }
+    lastMsgBodyReceived = msg;
+    lastMsgTimeReceived = millis();
+
     msgBody = msg;
     pendingCommand = true;
+    lastMessageTime = millis();
   }
   else if (t == "ledSign/line1") {
     line1 = msg;
@@ -289,6 +317,84 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     else if (t.endsWith("organizer")) eventHost = msg;
     else if (t.endsWith("attendees")) eventAttendees = msg;
   }
+  else if (t.startsWith("nextTodo/") || t.startsWith("nextTODO/")) {
+    DEBUG_PRINTLN("Todo Data [" + t + "]: " + msg);
+    if (t == "nextTodo/personal" || t == "nextTODO/personal") {
+      int nlIdx = msg.indexOf('\n');
+      if (nlIdx == -1) nlIdx = msg.indexOf('|');
+      if (nlIdx != -1) {
+        todoLine1 = msg.substring(0, nlIdx);
+        todoLine2 = msg.substring(nlIdx + 1);
+      } else {
+        todoLine1 = "TODO:";
+        todoLine2 = msg;
+      }
+      todoLine1.trim();
+      todoLine2.trim();
+    }
+    else if (t == "nextTodo/personal/line1" || t == "nextTODO/personal/line1") {
+      todoLine1 = msg;
+    }
+    else if (t == "nextTodo/personal/line2" || t == "nextTODO/personal/line2") {
+      todoLine2 = msg;
+    }
+    else if (t.startsWith("nextTodo/select") || t.startsWith("nextTODO/select")) {
+      String trimmedMsg = msg;
+      trimmedMsg.trim();
+      
+      bool isStart = (t == "nextTodo/select/start" || t == "nextTODO/select/start" || 
+                      ((t == "nextTodo/select" || t == "nextTODO/select") && trimmedMsg.equalsIgnoreCase("start")));
+                      
+      bool isStop = (t == "nextTodo/select/stop" || t == "nextTODO/select/stop" || 
+                     ((t == "nextTodo/select" || t == "nextTODO/select") && trimmedMsg.equalsIgnoreCase("stop")));
+                     
+      bool isReset = (t == "nextTodo/select/reset" || t == "nextTODO/select/reset" || 
+                      ((t == "nextTodo/select" || t == "nextTODO/select") && trimmedMsg.equalsIgnoreCase("reset")));
+
+      if (isStart) {
+        todoStartMillis = millis();
+        todoClockRunning = true;
+        todoFinalElapsedSecs = 0;
+        todoStopMillis = 0;
+        currentMode = "todoClock"; // Switch to todoClock mode automatically
+        DEBUG_PRINTLN("Todo Timer STARTED at millis " + String(todoStartMillis));
+      } else if (isStop) {
+        if (todoStartMillis == 0) {
+          currentMode = "bigClock";
+          todoClockRunning = false;
+          DEBUG_PRINTLN("Todo Timer STOPPED (never started) -> Reverted to bigClock");
+        } else {
+          if (todoClockRunning) {
+            todoFinalElapsedSecs = (millis() - todoStartMillis) / 1000;
+            todoClockRunning = false;
+          }
+          todoStopMillis = millis();
+          currentMode = "todoStopped";
+          DEBUG_PRINTLN("Todo Timer STOPPED -> final time: " + String(todoFinalElapsedSecs) + "s");
+
+          // Publish the elapsed time to nextTODO/personal/elapsed
+          unsigned long mins = (todoFinalElapsedSecs / 60) % 60;
+          unsigned long hours = todoFinalElapsedSecs / 3600;
+          char pubBuf[16];
+          sprintf(pubBuf, "%02lu:%02lu", hours, mins);
+          if (mqtt.connected()) {
+            mqtt.publish("nextTODO/personal/elapsed", pubBuf);
+            DEBUG_PRINTLN("Published elapsed time to nextTODO/personal/elapsed: " + String(pubBuf));
+          }
+        }
+        pendingCommand = true;
+      } else if (isReset) {
+        todoStartMillis = 0;
+        todoClockRunning = false;
+        todoFinalElapsedSecs = 0;
+        todoStopMillis = 0;
+        currentMode = "bigClock";
+        pendingCommand = true;
+        DEBUG_PRINTLN("Todo Timer RESET -> Reverted to bigClock");
+      }
+    }
+    pendingCommand = true;
+  }
 }
 
 void maintainMqtt() {
@@ -305,6 +411,8 @@ void maintainMqtt() {
       DEBUG_PRINTLN("Online");
       mqtt.subscribe("ledSign/#");
       mqtt.subscribe("nextEvent/#");
+      mqtt.subscribe("nextTodo/#");
+      mqtt.subscribe("nextTODO/#");
     } else {
       DEBUG_PRINTLN("Failed (rc=" + String(mqtt.state()) + ")");
     }
@@ -337,19 +445,24 @@ ScrollState scroll2 = {96, 0, false};
 
 /**
  * @brief Draws text with scrolling if it exceeds a maximum width.
+ * @return true if the scrolling wrapped around (completed a cycle) on this frame.
  */
-static void drawScrollingLine(int16_t x_min, int16_t x_max, int16_t y, const String &text, const GFXfont* font, uint16_t color, ScrollState &state) {
+static bool drawScrollingLine(int16_t x_min, int16_t x_max, int16_t y, const String &text, const GFXfont* font, uint16_t color, ScrollState &state) {
   display->setFont(font);
   int16_t x1, y1;
   uint16_t w, h;
   display->getTextBounds(text, 0, y, &x1, &y1, &w, &h);
   
   int16_t max_w = x_max - x_min;
+  bool wrapped = false;
   
   if (w > max_w) {
     if (millis() - state.lastScroll > 40) { // ~25 FPS scroll
       state.pos--;
-      if (state.pos + (int16_t)w < x_min) state.pos = x_max;
+      if (state.pos + (int16_t)w + 32 < x_min) {
+        state.pos = x_max;
+        wrapped = true;
+      }
       state.lastScroll = millis();
     }
     display->setCursor(state.pos, y);
@@ -358,6 +471,7 @@ static void drawScrollingLine(int16_t x_min, int16_t x_max, int16_t y, const Str
   }
   display->setTextColor(color);
   display->print(text);
+  return wrapped;
 }
 
 // --- RENDER MODES ---
@@ -397,6 +511,23 @@ void modeClock() {
   display->setFont(&FreeSansBold9pt7b); // Ensure default font
   // display->setFont(&FreeSansBold9pt7b); // Ensure default font
   drawLine(13,13, timeStr, primaryColor); // Centered vertically in a single line
+}
+
+/**
+ * @brief Displays the GMT clock in the format "HH:MMZ".
+ */
+void modeGmtClock() {
+  time_t now;
+  time(&now);
+  struct tm *timeinfo = gmtime(&now);
+  if (!timeinfo) return;
+  char buffer[16];
+  strftime(buffer, sizeof(buffer), "%H:%M:%SZ", timeinfo);
+  String timeStr = String(buffer);
+
+  display->setFont(&FreeSansBold9pt7b);
+  uint16_t colorOrange = display->color565(255, 128, 0);
+  drawCentered(13, timeStr, colorOrange);
 }
 
 /**
@@ -480,18 +611,77 @@ void modeScroll() {
 void modeMessage() {
   if(msgBody.length()==0){
     pendingCommand = false;
+    currentMode = previousMode;
     return;
   }
-  if (pendingCommand) {
-    scroll1.pos = 96; scroll2.pos = 96;
-    pendingCommand = false;
-  }
   
+  static String lastMsgBody = "";
+  static String lastL1 = "";
+  static bool wasMessageMode = false;
+  static unsigned long messageDisplayStartTime = 0;
+
   String l1 = messageType + (messageSender.length() > 0 ? " || " + messageSender : "");
   if (l1 == "") l1 = msgHeader;
 
-  drawScrollingLine(0, 96, 4, l1, &Picopixel, 0x001F, scroll1);
-  drawScrollingLine(0, 96, 14, msgBody, &FreeSans7pt7b, 0xFFE0, scroll2);
+  // Consume pendingCommand so it doesn't linger
+  if (pendingCommand) {
+    pendingCommand = false;
+  }
+
+  // Calculate widths to check if scrolling is active
+  int16_t x1, y1;
+  uint16_t w1 = 0, h1 = 0;
+  display->setFont(&Picopixel);
+  display->getTextBounds(l1, 0, 4, &x1, &y1, &w1, &h1);
+
+  uint16_t w2 = 0, h2 = 0;
+  display->setFont(&FreeSans7pt7b);
+  display->getTextBounds(msgBody, 0, 14, &x1, &y1, &w2, &h2);
+
+  // If the message body/header changed or we just entered message mode,
+  // reset the scroll positions and record the display start time.
+  if (msgBody != lastMsgBody || l1 != lastL1 || !wasMessageMode) {
+    scroll1.pos = 96;
+    scroll2.pos = 96;
+    lastMsgBody = msgBody;
+    lastL1 = l1;
+    wasMessageMode = true;
+    messageDisplayStartTime = millis();
+  }
+
+  bool wrapped1 = drawScrollingLine(0, 96, 4, l1, &Picopixel, 0x001F, scroll1);
+  bool wrapped2 = drawScrollingLine(0, 96, 14, msgBody, &FreeSans7pt7b, 0xFFE0, scroll2);
+
+  // Exit conditions:
+  bool shouldExit = false;
+  
+  if (w2 > 96) {
+    // Main message is scrolling, exit when it completes 1 scroll
+    if (wrapped2) shouldExit = true;
+  } else if (w1 > 96) {
+    // Header is scrolling (but main msg is static), exit when header completes 1 scroll
+    if (wrapped1) shouldExit = true;
+  } else {
+    // Both are static, exit after 5 seconds of actual display time
+    if (millis() - messageDisplayStartTime > 5000) shouldExit = true;
+  }
+
+  // Fail-safe timeout dynamically adjusted to the length of the longest scrolling line,
+  // or 60 seconds if static, to ensure it doesn't get cut off early.
+  unsigned long failSafeTimeout = 60000;
+  unsigned long maxW = (w1 > w2) ? w1 : w2;
+  if (maxW > 96) {
+    failSafeTimeout = (96 + maxW + 32) * 40 + 5000; // Expected scroll time with 32px padding + 5s buffer
+  }
+
+  if (millis() - messageDisplayStartTime > failSafeTimeout) shouldExit = true;
+
+  if (shouldExit) {
+    currentMode = previousMode;
+    msgBody = "";
+    wasMessageMode = false; // Reset for next message entry
+    return;
+  }
 }
 
 /**
@@ -620,6 +810,124 @@ void modeNextEvent() {
 }
 
 /**
+ * @brief Displays the next personal TODO item using a static top line and a scrolling bottom line.
+ */
+void modeNextTodo() {
+  if (pendingCommand) {
+    scroll2.pos = 96;
+    pendingCommand = false;
+  }
+
+  // Line 1: Header/Title (using primaryColor) - static, Org_01 font
+  display->setFont(&Org_01);
+  display->setTextSize(1);
+  display->setTextColor(primaryColor);
+  display->setCursor(0, 4);
+  display->print(todoLine1);
+
+  // Line 2: Todo Item Details (vibrant Cyan) - Default 5x7 font (nullptr), scrolls if it exceeds display width
+  drawScrollingLine(0, 96, 8, todoLine2, nullptr, display->color565(0, 255, 255), scroll2);
+}
+
+/**
+ * @brief Displays the next personal TODO item with a green elapsed clock in the top right.
+ */
+void modeNextTodoClock() {
+  // Calculate elapsed time
+  unsigned long elapsedSecs = 0;
+  if (todoClockRunning) {
+    elapsedSecs = (millis() - todoStartMillis) / 1000;
+  }
+  unsigned long mins = (elapsedSecs / 60) % 60;
+  unsigned long hours = elapsedSecs / 3600;
+  char clockBuf[16];
+  sprintf(clockBuf, "T+%lu:%02lu", hours, mins);
+
+
+
+  display->setFont(&Org_01);
+  display->setTextSize(1);
+
+  // Compute width of the green clock
+  int16_t x1, y1;
+  uint16_t w, h;
+  display->getTextBounds(clockBuf, 0, 4, &x1, &y1, &w, &h);
+  int16_t clockX = 96 - (int16_t)w;
+
+  if (pendingCommand) {
+    scroll1.pos = clockX - 2;
+    scroll2.pos = 96;
+    pendingCommand = false;
+  }
+
+  // Line 1 Left: Header/Title (using primaryColor) - scroll if it exceeds clock boundary (using baseline Y=4)
+  drawScrollingLine(0, clockX - 2, 4, todoLine1, &Org_01, primaryColor, scroll1);
+
+  // Line 1 Right: Elapsed Clock (Green) - static (aligned to baseline Y=4)
+  display->setFont(&Org_01);
+  display->setTextColor(display->color565(0, 255, 0)); // Green
+  display->setCursor(clockX, 4);
+  display->print("T+");
+  display->print(hours);
+
+  // Print the colon (either in green or black depending on even/odd seconds)
+  if (elapsedSecs % 2 == 0) {
+    display->setTextColor(display->color565(0, 255, 0)); // Green
+  } else {
+    display->setTextColor(0); // Black
+  }
+  display->print(":");
+
+  // Print the minutes (restore green color)
+  display->setTextColor(display->color565(0, 255, 0)); // Green
+  if (mins < 10) display->print("0");
+  display->print(mins);
+
+  // Line 2: Todo Item Details (vibrant Cyan) - Default 5x7 font (nullptr), scrolls if it exceeds display width
+  drawScrollingLine(0, 96, 8, todoLine2, nullptr, display->color565(0, 255, 255), scroll2);
+}
+
+/**
+ * @brief Displays the stopped TODO timer using the larger FreeMono9pt7b font, blinking for 5 seconds.
+ */
+void modeNextTodoStopped() {
+  unsigned long elapsedSinceStop = millis() - todoStopMillis;
+  if (elapsedSinceStop > 5000) {
+    // Revert to bigClock after 5 seconds
+    currentMode = "bigClock";
+    todoStartMillis = 0; // Reset for next start
+    pendingCommand = true;
+    return;
+  }
+
+  // Blink: toggle visibility every 500ms
+  bool showText = (elapsedSinceStop / 500) % 2 == 0;
+  if (!showText) {
+    return;
+  }
+
+  unsigned long mins = (todoFinalElapsedSecs / 60) % 60;
+  unsigned long hours = todoFinalElapsedSecs / 3600;
+  char clockBuf[16];
+  sprintf(clockBuf, "T+%lu:%02lu", hours, mins);
+
+  display->setFont(&FreeMono9pt7b);
+  display->setTextSize(1);
+
+  // Center the larger timer text both horizontally and vertically
+  int16_t x1, y1;
+  uint16_t w, h;
+  display->getTextBounds(clockBuf, 0, 13, &x1, &y1, &w, &h);
+  
+  int16_t x_centered = (96 - (int16_t)w) / 2 - x1;
+  int16_t y_centered = (16 - (int16_t)h) / 2 - y1;
+
+  display->setTextColor(display->color565(0, 255, 0)); // Green
+  display->setCursor(x_centered, y_centered);
+  display->print(clockBuf);
+}
+
+/**
  * @brief Test mode for messages to try out all fonts in the message body position.
  */
 void modeMessageTest() {
@@ -690,6 +998,7 @@ void render() {
   if (currentMode == "clock") modeClock();
   else if (currentMode == "bigClock") modeBigClock();
   else if (currentMode == "rainbowClock") modeRainbowClock();
+  else if (currentMode == "gmtClock") modeGmtClock();
   else if (currentMode == "message") modeMessage();
   else if (currentMode == "scroll") modeScroll();
   else if (currentMode == "static") modeStatic();
@@ -699,6 +1008,9 @@ void render() {
   else if (currentMode == "messageTest") modeMessageTest();
   else if (currentMode == "eventCountdown") modeEventCountdown();
   else if (currentMode == "nextEvent") modeNextEvent();
+  else if (currentMode == "showTodo") modeNextTodo();
+  else if (currentMode == "todoClock") modeNextTodoClock();
+  else if (currentMode == "todoStopped") modeNextTodoStopped();
   else modeClock();
 
   display->flipDMABuffer();
