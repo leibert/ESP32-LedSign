@@ -317,9 +317,13 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     else if (t.endsWith("organizer")) eventHost = msg;
     else if (t.endsWith("attendees")) eventAttendees = msg;
   }
-  else if (t.startsWith("nextTodo/") || t.startsWith("nextTODO/")) {
+  else if (t.startsWith("nextTodo/") || t.startsWith("nextTODO/") || t.startsWith("nexttodo/")) {
     DEBUG_PRINTLN("Todo Data [" + t + "]: " + msg);
-    if (t == "nextTodo/personal" || t == "nextTODO/personal") {
+    
+    String tLower = t;
+    tLower.toLowerCase();
+
+    if (tLower == "nexttodo/personal" || tLower == "nexttodo/personal") {
       int nlIdx = msg.indexOf('\n');
       if (nlIdx == -1) nlIdx = msg.indexOf('|');
       if (nlIdx != -1) {
@@ -332,26 +336,42 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       todoLine1.trim();
       todoLine2.trim();
     }
-    else if (t == "nextTodo/personal/line1" || t == "nextTODO/personal/line1") {
+    else if (tLower == "nexttodo/personal/line1") {
       todoLine1 = msg;
     }
-    else if (t == "nextTodo/personal/line2" || t == "nextTODO/personal/line2") {
+    else if (tLower == "nexttodo/personal/line2") {
       todoLine2 = msg;
     }
-    else if (t.startsWith("nextTodo/select") || t.startsWith("nextTODO/select")) {
+    else if (tLower.startsWith("nexttodo/select")) {
       String trimmedMsg = msg;
       trimmedMsg.trim();
       
-      bool isStart = (t == "nextTodo/select/start" || t == "nextTODO/select/start" || 
-                      ((t == "nextTodo/select" || t == "nextTODO/select") && trimmedMsg.equalsIgnoreCase("start")));
+      bool isStart = (tLower == "nexttodo/select/start" || 
+                      (tLower == "nexttodo/select" && trimmedMsg.equalsIgnoreCase("start")));
                       
-      bool isStop = (t == "nextTodo/select/stop" || t == "nextTODO/select/stop" || 
-                     ((t == "nextTodo/select" || t == "nextTODO/select") && trimmedMsg.equalsIgnoreCase("stop")));
+      bool isStop = (tLower == "nexttodo/select/stop" || 
+                     (tLower == "nexttodo/select" && trimmedMsg.equalsIgnoreCase("stop")));
                      
-      bool isReset = (t == "nextTodo/select/reset" || t == "nextTODO/select/reset" || 
-                      ((t == "nextTodo/select" || t == "nextTODO/select") && trimmedMsg.equalsIgnoreCase("reset")));
+      bool isReset = (tLower == "nexttodo/select/reset" || 
+                      (tLower == "nexttodo/select" && trimmedMsg.equalsIgnoreCase("reset")));
 
       if (isStart) {
+        // Publish elapsed time of previous timer run before resetting it!
+        if (todoStartMillis > 0) {
+          unsigned long elapsedSecs = todoFinalElapsedSecs;
+          if (todoClockRunning) {
+            elapsedSecs = (millis() - todoStartMillis) / 1000;
+          }
+          unsigned long mins = (elapsedSecs / 60) % 60;
+          unsigned long hours = elapsedSecs / 3600;
+          char pubBuf[16];
+          sprintf(pubBuf, "%02lu:%02lu", hours, mins);
+          if (mqtt.connected()) {
+            mqtt.publish("nextTODO/personal/elapsed", pubBuf);
+            DEBUG_PRINTLN("Published previous task elapsed time before reset: " + String(pubBuf));
+          }
+        }
+
         todoStartMillis = millis();
         todoClockRunning = true;
         todoFinalElapsedSecs = 0;
@@ -359,31 +379,35 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
         currentMode = "todoClock"; // Switch to todoClock mode automatically
         DEBUG_PRINTLN("Todo Timer STARTED at millis " + String(todoStartMillis));
       } else if (isStop) {
-        if (todoStartMillis == 0) {
+        if (currentMode != "todoClock") {
           currentMode = "bigClock";
           todoClockRunning = false;
-          DEBUG_PRINTLN("Todo Timer STOPPED (never started) -> Reverted to bigClock");
+          DEBUG_PRINTLN("Todo Timer STOPPED (mode is not todoClock) -> Reverted to bigClock");
         } else {
-          if (todoClockRunning) {
-            todoFinalElapsedSecs = (millis() - todoStartMillis) / 1000;
-            todoClockRunning = false;
-          }
+          todoFinalElapsedSecs = (millis() - todoStartMillis) / 1000;
+          todoClockRunning = false;
           todoStopMillis = millis();
           currentMode = "todoStopped";
           DEBUG_PRINTLN("Todo Timer STOPPED -> final time: " + String(todoFinalElapsedSecs) + "s");
-
-          // Publish the elapsed time to nextTODO/personal/elapsed
-          unsigned long mins = (todoFinalElapsedSecs / 60) % 60;
-          unsigned long hours = todoFinalElapsedSecs / 3600;
-          char pubBuf[16];
-          sprintf(pubBuf, "%02lu:%02lu", hours, mins);
-          if (mqtt.connected()) {
-            mqtt.publish("nextTODO/personal/elapsed", pubBuf);
-            DEBUG_PRINTLN("Published elapsed time to nextTODO/personal/elapsed: " + String(pubBuf));
-          }
         }
         pendingCommand = true;
       } else if (isReset) {
+        // Publish elapsed time before resetting
+        unsigned long elapsedSecs = 0;
+        if (todoClockRunning) {
+          elapsedSecs = (millis() - todoStartMillis) / 1000;
+        } else {
+          elapsedSecs = todoFinalElapsedSecs;
+        }
+        unsigned long mins = (elapsedSecs / 60) % 60;
+        unsigned long hours = elapsedSecs / 3600;
+        char pubBuf[16];
+        sprintf(pubBuf, "%02lu:%02lu", hours, mins);
+        if (mqtt.connected()) {
+          mqtt.publish("nextTODO/personal/elapsed", pubBuf);
+          DEBUG_PRINTLN("Published elapsed time on RESET: " + String(pubBuf));
+        }
+
         todoStartMillis = 0;
         todoClockRunning = false;
         todoFinalElapsedSecs = 0;
@@ -413,6 +437,7 @@ void maintainMqtt() {
       mqtt.subscribe("nextEvent/#");
       mqtt.subscribe("nextTodo/#");
       mqtt.subscribe("nextTODO/#");
+      mqtt.subscribe("nexttodo/#");
     } else {
       DEBUG_PRINTLN("Failed (rc=" + String(mqtt.state()) + ")");
     }
@@ -439,9 +464,10 @@ struct ScrollState {
   int16_t pos;
   unsigned long lastScroll;
   bool active;
+  unsigned long startMillis;
 };
-ScrollState scroll1 = {96, 0, false};
-ScrollState scroll2 = {96, 0, false};
+ScrollState scroll1 = {96, 0, false, 0};
+ScrollState scroll2 = {96, 0, false, 0};
 
 /**
  * @brief Draws text with scrolling if it exceeds a maximum width.
@@ -457,13 +483,17 @@ static bool drawScrollingLine(int16_t x_min, int16_t x_max, int16_t y, const Str
   bool wrapped = false;
   
   if (w > max_w) {
-    if (millis() - state.lastScroll > 40) { // ~25 FPS scroll
-      state.pos--;
-      if (state.pos + (int16_t)w + 32 < x_min) {
-        state.pos = x_max;
-        wrapped = true;
+    if (millis() - state.startMillis < 1000) {
+      state.pos = x_min; // Pause at the start position (showing as much text as possible)
+    } else {
+      if (millis() - state.lastScroll > 40) { // ~25 FPS scroll
+        state.pos--;
+        if (state.pos + (int16_t)w + 32 < x_min) {
+          state.pos = x_max;
+          wrapped = true;
+        }
+        state.lastScroll = millis();
       }
-      state.lastScroll = millis();
     }
     display->setCursor(state.pos, y);
   } else {
@@ -814,7 +844,8 @@ void modeNextEvent() {
  */
 void modeNextTodo() {
   if (pendingCommand) {
-    scroll2.pos = 96;
+    scroll2.pos = 0;
+    scroll2.startMillis = millis();
     pendingCommand = false;
   }
 
@@ -855,8 +886,10 @@ void modeNextTodoClock() {
   int16_t clockX = 96 - (int16_t)w;
 
   if (pendingCommand) {
-    scroll1.pos = clockX - 2;
-    scroll2.pos = 96;
+    scroll1.pos = 0;
+    scroll1.startMillis = millis();
+    scroll2.pos = 0;
+    scroll2.startMillis = millis();
     pendingCommand = false;
   }
 
@@ -895,13 +928,16 @@ void modeNextTodoStopped() {
   if (elapsedSinceStop > 5000) {
     // Revert to bigClock after 5 seconds
     currentMode = "bigClock";
-    todoStartMillis = 0; // Reset for next start
+    // NOTE: Don't reset todoStartMillis here! Keep it until a new start is received.
     pendingCommand = true;
     return;
   }
 
-  // Blink: toggle visibility every 500ms
-  bool showText = (elapsedSinceStop / 500) % 2 == 0;
+  // Blink: always show the text for the first 1 second, then blink every 250ms
+  bool showText = true;
+  if (elapsedSinceStop > 1000) {
+    showText = ((elapsedSinceStop - 1000) / 250) % 2 == 0;
+  }
   if (!showText) {
     return;
   }
@@ -1066,6 +1102,25 @@ void loop() {
   }
 
   render();
+
+  // Periodic publish of elapsed time to nextTODO/personal/elapsed every 10 seconds
+  static unsigned long lastMqttPublishMillis = 0;
+  if (todoClockRunning) {
+    if (millis() - lastMqttPublishMillis >= 10000) {
+      lastMqttPublishMillis = millis();
+      unsigned long elapsedSecs = (millis() - todoStartMillis) / 1000;
+      unsigned long mins = (elapsedSecs / 60) % 60;
+      unsigned long hours = elapsedSecs / 3600;
+      char pubBuf[16];
+      sprintf(pubBuf, "%02lu:%02lu", hours, mins);
+      if (mqtt.connected()) {
+        mqtt.publish("nextTODO/personal/elapsed", pubBuf);
+        DEBUG_PRINTLN("Periodic publish elapsed time: " + String(pubBuf));
+      }
+    }
+  } else {
+    lastMqttPublishMillis = 0;
+  }
 
   static unsigned long lastHeartbeat = 0;
   if (millis() - lastHeartbeat > 60000) {
