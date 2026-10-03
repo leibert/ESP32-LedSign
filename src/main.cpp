@@ -134,9 +134,61 @@ String todoLine1 = "TODO:";
 String todoLine2 = "None";
 bool todoClockRunning = false;
 unsigned long todoStartMillis = 0;
-unsigned long todoStopMillis = 0;
 unsigned long todoFinalElapsedSecs = 0;
 bool pendingCommand = false;
+
+/**
+ * @brief Seconds accumulated on the active todo task: the frozen baseline
+ * (todoFinalElapsedSecs) plus whatever has ticked by since the clock last
+ * started, if it's currently running.
+ */
+unsigned long getCurrentElapsedSecs() {
+  if (todoClockRunning) {
+    return todoFinalElapsedSecs + (millis() - todoStartMillis) / 1000;
+  }
+  return todoFinalElapsedSecs;
+}
+
+/**
+ * @brief Formats and publishes the current elapsed time to nextTODO/personal/elapsed,
+ * remembering the payload in a short rolling history so the handler for that same
+ * topic can recognize this publish bouncing back off the broker (we're subscribed
+ * to nextTODO/#) and not mistake our own echo for an externally-pushed baseline.
+ *
+ * A single "last published" value isn't enough: if two of our own publishes go out
+ * close together (e.g. STOP immediately followed by RESET), the earlier one's echo
+ * can arrive after the later publish has already moved "last" on, making it look
+ * like a brand-new external baseline and corrupting state we just reset. Keeping a
+ * short history of recent self-publishes (each valid for a few seconds) closes
+ * that race.
+ */
+struct SelfPublish { String msg; unsigned long atMillis; };
+SelfPublish recentSelfPublishes[4];
+int selfPublishIdx = 0;
+const unsigned long SELF_ECHO_WINDOW_MS = 5000;
+
+void publishElapsed(unsigned long secs) {
+  unsigned long mins = (secs / 60) % 60;
+  unsigned long hours = secs / 3600;
+  char pubBuf[16];
+  sprintf(pubBuf, "%02lu:%02lu", hours, mins);
+  recentSelfPublishes[selfPublishIdx] = {String(pubBuf), millis()};
+  selfPublishIdx = (selfPublishIdx + 1) % 4;
+  if (mqtt.connected()) {
+    mqtt.publish("nextTODO/personal/elapsed", pubBuf);
+    DEBUG_PRINTLN("Published elapsed time: " + String(pubBuf));
+  }
+}
+
+static bool isRecentSelfEcho(const String &msg) {
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++) {
+    if (recentSelfPublishes[i].msg == msg && (now - recentSelfPublishes[i].atMillis) < SELF_ECHO_WINDOW_MS) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // Scrolling & Positioning
 int16_t scrollPos = 0;
@@ -231,7 +283,8 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       DEBUG_PRINTLN("Ignored mode request: message disabled");
     } else {
       DEBUG_PRINTLN("Mode Change Request: " + msg);
-      if (currentMode != msg && currentMode != "message" && currentMode != "test" && currentMode != "messageTest") {
+      if (currentMode != msg && currentMode != "message" && currentMode != "test" &&
+          currentMode != "messageTest" && currentMode != "todoClock") {
         previousMode = currentMode;
       }
       currentMode = msg;
@@ -342,6 +395,30 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     else if (tLower == "nexttodo/personal/line2") {
       todoLine2 = msg;
     }
+    else if (tLower == "nexttodo/personal/elapsed") {
+      // This topic is also where WE publish status (periodic ticks, stop/reset
+      // results), and we're subscribed to nextTODO/#, so our own publishes
+      // bounce back here too. Recognize those against our recent self-publish
+      // history and ignore them; anything else is a real external baseline
+      // (e.g. prior logged time pushed by the Todoist collator) and must be
+      // honored whether it arrives before START or — as is typical, since
+      // computing it requires a Todoist lookup that finishes after the sign
+      // has already started counting — after.
+      if (isRecentSelfEcho(msg)) {
+        DEBUG_PRINTLN("Ignored elapsed echo: " + msg);
+      } else {
+        unsigned long hours = 0, mins = 0;
+        if (sscanf(msg.c_str(), "%lu:%lu", &hours, &mins) == 2) {
+          todoFinalElapsedSecs = hours * 3600UL + mins * 60UL;
+          if (todoClockRunning) {
+            // Rebase the running start point so the new baseline takes effect
+            // immediately without double-counting time already elapsed.
+            todoStartMillis = millis();
+          }
+          DEBUG_PRINTLN("Todo clock baseline set from elapsed topic: " + String(todoFinalElapsedSecs) + "s");
+        }
+      }
+    }
     else if (tLower.startsWith("nexttodo/select")) {
       String trimmedMsg = msg;
       trimmedMsg.trim();
@@ -356,62 +433,45 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
                       (tLower == "nexttodo/select" && trimmedMsg.equalsIgnoreCase("reset")));
 
       if (isStart) {
-        // Publish elapsed time of previous timer run before resetting it!
-        if (todoStartMillis > 0) {
-          unsigned long elapsedSecs = todoFinalElapsedSecs;
-          if (todoClockRunning) {
-            elapsedSecs = (millis() - todoStartMillis) / 1000;
-          }
-          unsigned long mins = (elapsedSecs / 60) % 60;
-          unsigned long hours = elapsedSecs / 3600;
-          char pubBuf[16];
-          sprintf(pubBuf, "%02lu:%02lu", hours, mins);
-          if (mqtt.connected()) {
-            mqtt.publish("nextTODO/personal/elapsed", pubBuf);
-            DEBUG_PRINTLN("Published previous task elapsed time before reset: " + String(pubBuf));
-          }
+        // If the clock was left running (e.g. STOP was never pressed before
+        // this START), freeze and publish its elapsed time first so that
+        // session isn't lost.
+        if (todoClockRunning) {
+          todoFinalElapsedSecs = getCurrentElapsedSecs();
+          publishElapsed(todoFinalElapsedSecs);
         }
 
+        // Remember what the sign was showing before the todo clock took over,
+        // so STOP can return to it immediately instead of a hardcoded mode.
+        if (currentMode != "todoClock" && currentMode != "message" &&
+            currentMode != "test" && currentMode != "messageTest") {
+          previousMode = currentMode;
+        }
+
+        // todoFinalElapsedSecs is the baseline to resume from: left over from
+        // the block above, from a previous STOP, or pushed in externally via
+        // nextTODO/personal/elapsed while idle (see that topic's handler
+        // above). START must never reset it — only RESET explicitly zeroes
+        // the clock.
         todoStartMillis = millis();
         todoClockRunning = true;
-        todoFinalElapsedSecs = 0;
-        todoStopMillis = 0;
         currentMode = "todoClock"; // Switch to todoClock mode automatically
-        DEBUG_PRINTLN("Todo Timer STARTED at millis " + String(todoStartMillis));
+        DEBUG_PRINTLN("Todo Timer STARTED at millis " + String(todoStartMillis) + " from baseline " + String(todoFinalElapsedSecs) + "s");
       } else if (isStop) {
-        if (currentMode != "todoClock") {
-          currentMode = "bigClock";
-          todoClockRunning = false;
-          DEBUG_PRINTLN("Todo Timer STOPPED (mode is not todoClock) -> Reverted to bigClock");
-        } else {
-          todoFinalElapsedSecs = (millis() - todoStartMillis) / 1000;
-          todoClockRunning = false;
-          todoStopMillis = millis();
-          currentMode = "todoStopped";
-          DEBUG_PRINTLN("Todo Timer STOPPED -> final time: " + String(todoFinalElapsedSecs) + "s");
-        }
+        todoFinalElapsedSecs = getCurrentElapsedSecs();
+        publishElapsed(todoFinalElapsedSecs);
+
+        todoClockRunning = false;
+        currentMode = previousMode; // Revert immediately to whatever was showing before
+        DEBUG_PRINTLN("Todo Timer STOPPED -> Reverted to " + previousMode);
         pendingCommand = true;
       } else if (isReset) {
         // Publish elapsed time before resetting
-        unsigned long elapsedSecs = 0;
-        if (todoClockRunning) {
-          elapsedSecs = (millis() - todoStartMillis) / 1000;
-        } else {
-          elapsedSecs = todoFinalElapsedSecs;
-        }
-        unsigned long mins = (elapsedSecs / 60) % 60;
-        unsigned long hours = elapsedSecs / 3600;
-        char pubBuf[16];
-        sprintf(pubBuf, "%02lu:%02lu", hours, mins);
-        if (mqtt.connected()) {
-          mqtt.publish("nextTODO/personal/elapsed", pubBuf);
-          DEBUG_PRINTLN("Published elapsed time on RESET: " + String(pubBuf));
-        }
+        publishElapsed(getCurrentElapsedSecs());
 
         todoStartMillis = 0;
         todoClockRunning = false;
         todoFinalElapsedSecs = 0;
-        todoStopMillis = 0;
         currentMode = "bigClock";
         pendingCommand = true;
         DEBUG_PRINTLN("Todo Timer RESET -> Reverted to bigClock");
@@ -865,10 +925,7 @@ void modeNextTodo() {
  */
 void modeNextTodoClock() {
   // Calculate elapsed time
-  unsigned long elapsedSecs = 0;
-  if (todoClockRunning) {
-    elapsedSecs = (millis() - todoStartMillis) / 1000;
-  }
+  unsigned long elapsedSecs = getCurrentElapsedSecs();
   unsigned long mins = (elapsedSecs / 60) % 60;
   unsigned long hours = elapsedSecs / 3600;
   char clockBuf[16];
@@ -918,49 +975,6 @@ void modeNextTodoClock() {
 
   // Line 2: Todo Item Details (vibrant Cyan) - Default 5x7 font (nullptr), scrolls if it exceeds display width
   drawScrollingLine(0, 96, 8, todoLine2, nullptr, display->color565(0, 255, 255), scroll2);
-}
-
-/**
- * @brief Displays the stopped TODO timer using the larger FreeMono9pt7b font, blinking for 5 seconds.
- */
-void modeNextTodoStopped() {
-  unsigned long elapsedSinceStop = millis() - todoStopMillis;
-  if (elapsedSinceStop > 5000) {
-    // Revert to bigClock after 5 seconds
-    currentMode = "bigClock";
-    // NOTE: Don't reset todoStartMillis here! Keep it until a new start is received.
-    pendingCommand = true;
-    return;
-  }
-
-  // Blink: always show the text for the first 1 second, then blink every 250ms
-  bool showText = true;
-  if (elapsedSinceStop > 1000) {
-    showText = ((elapsedSinceStop - 1000) / 250) % 2 == 0;
-  }
-  if (!showText) {
-    return;
-  }
-
-  unsigned long mins = (todoFinalElapsedSecs / 60) % 60;
-  unsigned long hours = todoFinalElapsedSecs / 3600;
-  char clockBuf[16];
-  sprintf(clockBuf, "T+%lu:%02lu", hours, mins);
-
-  display->setFont(&FreeMono9pt7b);
-  display->setTextSize(1);
-
-  // Center the larger timer text both horizontally and vertically
-  int16_t x1, y1;
-  uint16_t w, h;
-  display->getTextBounds(clockBuf, 0, 13, &x1, &y1, &w, &h);
-  
-  int16_t x_centered = (96 - (int16_t)w) / 2 - x1;
-  int16_t y_centered = (16 - (int16_t)h) / 2 - y1;
-
-  display->setTextColor(display->color565(0, 255, 0)); // Green
-  display->setCursor(x_centered, y_centered);
-  display->print(clockBuf);
 }
 
 /**
@@ -1046,7 +1060,6 @@ void render() {
   else if (currentMode == "nextEvent") modeNextEvent();
   else if (currentMode == "showTodo") modeNextTodo();
   else if (currentMode == "todoClock") modeNextTodoClock();
-  else if (currentMode == "todoStopped") modeNextTodoStopped();
   else modeClock();
 
   display->flipDMABuffer();
@@ -1108,15 +1121,7 @@ void loop() {
   if (todoClockRunning) {
     if (millis() - lastMqttPublishMillis >= 10000) {
       lastMqttPublishMillis = millis();
-      unsigned long elapsedSecs = (millis() - todoStartMillis) / 1000;
-      unsigned long mins = (elapsedSecs / 60) % 60;
-      unsigned long hours = elapsedSecs / 3600;
-      char pubBuf[16];
-      sprintf(pubBuf, "%02lu:%02lu", hours, mins);
-      if (mqtt.connected()) {
-        mqtt.publish("nextTODO/personal/elapsed", pubBuf);
-        DEBUG_PRINTLN("Periodic publish elapsed time: " + String(pubBuf));
-      }
+      publishElapsed(getCurrentElapsedSecs());
     }
   } else {
     lastMqttPublishMillis = 0;
